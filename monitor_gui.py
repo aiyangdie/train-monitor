@@ -1,159 +1,192 @@
 # -*- coding: utf-8 -*-
 """
-训练监控 - GUI 可视化版（Win 原生窗口，无需安装依赖）
-运行：python monitor_gui.py
+训练实时监控面板 v1.1.0
+
+核心特性:
+  - 自动检测 NVIDIA GPU（nvidia-smi 多级搜索）
+  - 自动发现训练进程（Python / WeClone / 命令行关键词）
+  - 自动定位项目目录（用户可手动选择，设置持久化）
+  - 友好错误诊断：三路独立检测，任一失败不影响其他
+  - 零外部依赖：仅标准库 + tkinter
 """
 import os
+import sys
+import json
+import time
+import threading
 import subprocess
 import platform
-import threading
-import time
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
+from collections import deque
 
 import tkinter as tk
-from tkinter import ttk, font
+from tkinter import ttk, font, filedialog, messagebox
 
-# ======== 配置 ========
-# 把项目所在目录自动识别为当前脚本所在目录（不再写死路径）
-_PROJECT_ROOT = Path(__file__).resolve().parent
-REFRESH_MS = 3000   # 每 3 秒刷新一次
-SEARCH_DIRS = [
-    _PROJECT_ROOT,
-    _PROJECT_ROOT.parent,
-    Path.home() / "Documents",
-    Path.home() / ".cache" / "huggingface",
+# ======================================================================
+# 全局配置
+# ======================================================================
+REFRESH_MS = 3000
+CHART_POINTS = 60
+CONFIG_FILE = Path.home() / ".train_monitor_config.json"
+
+CKPT_KEYWORDS = [
+    "checkpoint", "adapter", "safetensors", "pytorch_model",
+    "optimizer", "trainer_state", "training_args",
+    "weclone", "sft", "lora", "adapter_model",
+    ".bin", ".ckpt",
 ]
-CKPT_KEYWORDS = ["checkpoint", "adapter", "safetensors", "pytorch_model",
-                 "optimizer", "rng_state", "trainer_state", "training_args",
-                 "weclone", "sft", "lora", "adapter_model"]
 
-# nvidia-smi 的常见安装路径（Windows）
-_NVIDIA_SMI_CANDIDATES_WIN = [
+TRAIN_PROC_KEYWORDS = [
+    "python", "weclone", "train", "finetune", "fine-tune",
+    "sft", "lora", "accelerate", "deepspeed", "torch",
+]
+
+_NVIDIA_SMI_CANDIDATES = [
     r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
     r"C:\Windows\System32\nvidia-smi.exe",
     r"C:\Windows\SysWOW64\nvidia-smi.exe",
 ]
-# NVIDIA 驱动目录会随大版本号变化，通过枚举 C:\Program Files\NVIDIA Corporation\ 找 NVSMI 目录
-_NVIDIA_ROOT = Path(r"C:\Program Files\NVIDIA Corporation")
-
-# 缓存 nvidia-smi 路径，避免每次刷新都去扫描
-_CACHED_NVIDIA_SMI = None
-# =====================
 
 
-def find_nvidia_smi():
-    """
-    找到 nvidia-smi 可执行文件的完整路径。
-    优先顺序：PATH -> 常见安装路径 -> 扫描 C:/Program Files/NVIDIA Corporation/
-    返回 (path_or_None, message)
-    """
-    global _CACHED_NVIDIA_SMI
-    if _CACHED_NVIDIA_SMI and Path(_CACHED_NVIDIA_SMI).exists():
-        return _CACHED_NVIDIA_SMI, "ok"
-
-    # 1) PATH
-    import shutil
-    found = shutil.which("nvidia-smi")
-    if found:
-        _CACHED_NVIDIA_SMI = found
-        return found, "ok"
-
-    # 2) 常见固定路径
-    for p in _NVIDIA_SMI_CANDIDATES_WIN:
-        if Path(p).exists():
-            _CACHED_NVIDIA_SMI = p
-            return p, "ok"
-
-    # 3) 扫描 C:\Program Files\NVIDIA Corporation 下所有 *NVSMI* 目录
+# ======================================================================
+# 基础工具
+# ======================================================================
+def run_cmd(args, timeout=6):
     try:
-        if _NVIDIA_ROOT.exists():
-            for sub in _NVIDIA_ROOT.iterdir():
-                if sub.is_dir() and "NVSMI" in sub.name.upper():
-                    candidate = sub / "nvidia-smi.exe"
-                    if candidate.exists():
-                        _CACHED_NVIDIA_SMI = str(candidate)
-                        return str(candidate), "ok"
+        si = None
+        if platform.system() == "Windows":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        r = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            errors="ignore",
+            startupinfo=si,
+        )
+        return (r.stdout or "").strip(), r.returncode
+    except Exception:
+        return "", -1
+
+
+def fmt_duration(seconds):
+    if seconds is None or seconds < 0:
+        return "-"
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return "%d时%d分%d秒" % (h, m, sec)
+    if m:
+        return "%d分%d秒" % (m, sec)
+    return "%d秒" % sec
+
+
+def load_config():
+    try:
+        if CONFIG_FILE.exists():
+            with open(str(CONFIG_FILE), "r", encoding="utf-8", errors="ignore") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_config(data):
+    try:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(CONFIG_FILE), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
-    return None, (
-        "未找到 nvidia-smi。请确认：\n"
-        "  1) 电脑已安装 NVIDIA 显卡驱动\n"
-        "  2) C:/Program Files/NVIDIA Corporation/.../NVSMI/ 目录下存在 nvidia-smi.exe\n"
-        "  3) 或者把 nvidia-smi 所在目录加入系统环境变量 PATH"
-    )
 
-
-def run_cmd(cmd, timeout=5):
+# ======================================================================
+# nvidia-smi 路径搜索
+# ======================================================================
+def find_nvidia_smi():
+    """返回 (path_or_None, message)"""
+    p = shutil.which("nvidia-smi")
+    if p:
+        return p, "ok"
+    for c in _NVIDIA_SMI_CANDIDATES:
+        if Path(c).exists():
+            return c, "ok"
+    # 扫描 C:\Program Files\NVIDIA Corporation 下所有含 NVSMI 的目录
     try:
-        # 传进来的可能是 list（推荐，避免 shell 解析问题）
-        if isinstance(cmd, (list, tuple)):
-            r = subprocess.run(list(cmd), shell=False, capture_output=True,
-                               text=True, timeout=timeout, errors="ignore")
-        else:
-            r = subprocess.run(cmd, shell=True, capture_output=True,
-                               text=True, timeout=timeout, errors="ignore")
-        return r.stdout.strip()
+        base = Path(r"C:\Program Files\NVIDIA Corporation")
+        if base.exists():
+            for sub in base.iterdir():
+                try:
+                    if not sub.is_dir():
+                        continue
+                    if "NVSMI" in sub.name.upper():
+                        candidate = sub / "nvidia-smi.exe"
+                        if candidate.exists():
+                            return str(candidate), "ok"
+                except Exception:
+                    pass
     except Exception:
-        return ""
+        pass
+    msg = ("未找到 nvidia-smi 可执行文件。\n\n"
+           "请尝试：\n"
+           "  1) 确认电脑已安装 NVIDIA 显卡驱动\n"
+           "  2) 把 nvidia-smi.exe 所在目录加入系统环境变量 PATH\n"
+           "  3) 或安装最新版 NVIDIA 驱动")
+    return None, msg
 
 
+# ======================================================================
+# GPU 检测
+# ======================================================================
 def get_gpu_info():
-    """
-    检测 GPU 状态。
-    返回 {"name", "gpu_util", "mem_used_mb", "mem_total_mb",
-          "temp_c", "power_w", "power_limit_w", "gpu_count", "error"}
-    任一失败时，error 字段会包含用户可读的中文错误提示。
-    """
     smi_path, msg = find_nvidia_smi()
     if smi_path is None:
         return {"error": msg}
-
-    # 多 GPU 环境：每行一块卡，取总利用率/总显存/平均温度/第一张卡的名字
-    out = run_cmd([
+    out, rc = run_cmd([
         smi_path,
         "--query-gpu=name,utilization.gpu,memory.used,memory.total,"
-        "temperature.gpu,power.draw,power.limit,count",
-        "--format=csv,noheader,nounits"
+        "temperature.gpu,power.draw,power.limit",
+        "--format=csv,noheader,nounits",
     ])
-    if not out:
-        # 再试一次不带 count（部分老驱动不支持）
-        out = run_cmd([
-            smi_path,
-            "--query-gpu=name,utilization.gpu,memory.used,memory.total,"
-            "temperature.gpu,power.draw,power.limit",
-            "--format=csv,noheader,nounits"
-        ])
-        if not out:
-            return {"error": "nvidia-smi 已找到但无输出，请检查驱动状态。"}
-
+    if not out or rc != 0:
+        return {"error": "nvidia-smi 调用失败（返回码 %s）" % rc}
     lines = [l for l in out.splitlines() if l.strip()]
     if not lines:
-        return {"error": "未检测到 NVIDIA GPU。"}
+        return {"error": "nvidia-smi 返回空结果（未检测到 NVIDIA GPU）"}
 
     gpus = []
     for line in lines:
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 7:
+        if len(parts) < 6:
             continue
         try:
+            def _to_float(s):
+                if not s or "[Not" in s.upper() or s.upper() == "N/A":
+                    return 0.0
+                return float(s)
+            def _to_str(s):
+                if not s or "[Not" in s.upper() or s.upper() == "N/A":
+                    return "?"
+                return s
             gpus.append({
                 "name": parts[0],
-                "gpu_util": float(parts[1]) if parts[1] else 0.0,
-                "mem_used_mb": float(parts[2]) if parts[2] else 0.0,
-                "mem_total_mb": float(parts[3]) if parts[3] else 0.0,
-                "temp_c": float(parts[4]) if parts[4] else 0.0,
-                "power_w": parts[5] if parts[5] else "?",
-                "power_limit_w": parts[6] if parts[6] else "?",
+                "gpu_util": _to_float(parts[1]),
+                "mem_used_mb": _to_float(parts[2]),
+                "mem_total_mb": _to_float(parts[3]),
+                "temp_c": _to_float(parts[4]),
+                "power_w": _to_str(parts[5]) if len(parts) > 5 else "?",
+                "power_limit_w": _to_str(parts[6]) if len(parts) > 6 else "?",
             })
-        except (ValueError, IndexError):
+        except Exception:
             continue
 
     if not gpus:
-        return {"error": "nvidia-smi 输出异常，无法解析。"}
+        return {"error": "nvidia-smi 输出无法解析"}
 
-    # 汇总：若有多 GPU，展示总利用率/总显存
     if len(gpus) == 1:
         g = gpus[0]
         return {
@@ -167,14 +200,13 @@ def get_gpu_info():
             "gpu_count": 1,
             "error": None,
         }
-    # 多 GPU：汇总
     total_util = sum(g["gpu_util"] for g in gpus) / len(gpus)
     total_mem_used = sum(g["mem_used_mb"] for g in gpus)
     total_mem_total = sum(g["mem_total_mb"] for g in gpus)
     avg_temp = sum(g["temp_c"] for g in gpus) / len(gpus)
-    names = "，".join(g["name"] for g in gpus[:2]) + (f" 等 {len(gpus)} 张卡" if len(gpus) > 2 else "")
+    name_str = "、".join(g["name"] for g in gpus)
     return {
-        "name": names,
+        "name": name_str,
         "gpu_util": total_util,
         "mem_used_mb": total_mem_used,
         "mem_total_mb": total_mem_total,
@@ -186,77 +218,132 @@ def get_gpu_info():
     }
 
 
+# ======================================================================
+# 进程检测（Windows 原生 API）
+# ======================================================================
 def list_training_processes():
-    """用 Windows 原生 API 枚举进程（零依赖，不需要 psutil）"""
     procs = []
     try:
         import ctypes
         from ctypes import wintypes
+
         kernel32 = ctypes.windll.kernel32
         psapi = ctypes.windll.psapi
 
         class PROCESSENTRY32(ctypes.Structure):
-            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
-                        ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
-                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
-                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
-                        ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_char * 260)]
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_char * 260),
+            ]
 
         class FILETIME(ctypes.Structure):
-            _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+            _fields_ = [
+                ("dwLowDateTime", wintypes.DWORD),
+                ("dwHighDateTime", wintypes.DWORD),
+            ]
 
         class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
-            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
-                        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
-                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                        ("PagefileUsage", ctypes.c_size_t),
-                        ("PeakPagefileUsage", ctypes.c_size_t)]
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
 
-        h_snap = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
-        if h_snap == -1:
-            return []
         pe = PROCESSENTRY32()
         pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
-        PROCESS_QUERY_INFORMATION = 0x0400
+        h_snap = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if h_snap == -1:
+            return procs
+        # PROCESS_QUERY_LIMITED_INFORMATION (0x1000) 在 Vista+ 更通用，即使非管理员也能查询时间信息
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         PROCESS_VM_READ = 0x0010
-
         ok = kernel32.Process32First(h_snap, ctypes.byref(pe))
         while ok:
             try:
-                name = pe.szExeFile.decode("gbk", errors="ignore").strip()
+                exe_name = pe.szExeFile.decode("gbk", errors="ignore").strip()
             except Exception:
-                name = ""
-            if "python" in name.lower() or "weclone" in name.lower():
-                pid = pe.th32ProcessID
-                mem_mb = 0
-                cpu_s = 0.0
-                start_str = ""
-                h_proc = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid)
-                if h_proc:
-                    creation = FILETIME()
-                    exit_t = FILETIME()
-                    kernel_t = FILETIME()
-                    user_t = FILETIME()
-                    if kernel32.GetProcessTimes(h_proc, ctypes.byref(creation), ctypes.byref(exit_t),
-                                                ctypes.byref(kernel_t), ctypes.byref(user_t)):
-                        def ft_to_sec(ft):
-                            return (ft.dwHighDateTime * (2**32) + ft.dwLowDateTime) / 10_000_000
-                        creation_sec = ft_to_sec(creation) - 11644473600
-                        cpu_s = ft_to_sec(kernel_t) + ft_to_sec(user_t)
+                exe_name = ""
+            name_lower = exe_name.lower()
+            is_train = any(k in name_lower for k in TRAIN_PROC_KEYWORDS)
+            if not is_train:
+                ok = kernel32.Process32Next(h_snap, ctypes.byref(pe))
+                continue
+
+            pid = pe.th32ProcessID
+            mem_mb = 0.0
+            cpu_s = 0.0
+            start_time = ""
+            # 先用 LIMITED 权限（兼容非管理员），失败再用旧权限
+            h_proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+            opened_ok = h_proc
+            if not h_proc:
+                h_proc = kernel32.OpenProcess(
+                    PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid
+                )
+            if h_proc:
+                creation = FILETIME()
+                exit_t = FILETIME()
+                kernel_t = FILETIME()
+                user_t = FILETIME()
+                try:
+                    if kernel32.GetProcessTimes(
+                        h_proc,
+                        ctypes.byref(creation),
+                        ctypes.byref(exit_t),
+                        ctypes.byref(kernel_t),
+                        ctypes.byref(user_t),
+                    ):
+                        creation_sec = (
+                            (creation.dwHighDateTime * (2**32) + creation.dwLowDateTime)
+                            / 10_000_000 - 11644473600
+                        )
+                        k_s = (
+                            (kernel_t.dwHighDateTime * (2**32) + kernel_t.dwLowDateTime)
+                            / 10_000_000
+                        )
+                        u_s = (
+                            (user_t.dwHighDateTime * (2**32) + user_t.dwLowDateTime)
+                            / 10_000_000
+                        )
+                        cpu_s = k_s + u_s
                         if creation_sec > 0:
-                            start_str = datetime.fromtimestamp(creation_sec).strftime("%Y/%m/%d %H:%M:%S")
+                            start_time = datetime.fromtimestamp(creation_sec).strftime(
+                                "%Y/%m/%d %H:%M:%S"
+                            )
+                except Exception:
+                    pass
+                try:
                     pmc = PROCESS_MEMORY_COUNTERS()
                     pmc.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
-                    if psapi.GetProcessMemoryInfo(h_proc, ctypes.byref(pmc), ctypes.sizeof(pmc)):
-                        mem_mb = pmc.WorkingSetSize / 1024 / 1024
-                    kernel32.CloseHandle(h_proc)
-                procs.append({
-                    "pid": str(pid), "name": name,
-                    "cpu_s": cpu_s, "mem_mb": mem_mb, "start_time": start_str,
-                })
+                    if psapi.GetProcessMemoryInfo(
+                        h_proc, ctypes.byref(pmc), ctypes.sizeof(pmc)
+                    ):
+                        mem_mb = float(pmc.WorkingSetSize) / 1024.0 / 1024.0
+                except Exception:
+                    pass
+                kernel32.CloseHandle(h_proc)
+            procs.append({
+                "pid": str(pid),
+                "name": exe_name,
+                "cpu_s": cpu_s,
+                "mem_mb": mem_mb,
+                "start_time": start_time,
+            })
             ok = kernel32.Process32Next(h_snap, ctypes.byref(pe))
         kernel32.CloseHandle(h_snap)
         return procs
@@ -264,354 +351,584 @@ def list_training_processes():
         return procs
 
 
-def find_ckpt_files(since_hours=24):
+# ======================================================================
+# 项目目录识别 + Checkpoint 搜索
+# ======================================================================
+def detect_project_dirs():
+    dirs = []
+    seen = set()
+
+    def _add(d_path):
+        try:
+            p = Path(d_path)
+            if not p.exists():
+                return
+            key = str(p.resolve())
+            if key in seen:
+                return
+            seen.add(key)
+            dirs.append(p)
+        except Exception:
+            pass
+
+    try:
+        script_dir = Path(__file__).resolve().parent
+        _add(script_dir)
+        _add(script_dir.parent)
+    except Exception:
+        pass
+    _add(Path.cwd())
+    _add(Path.home() / "Documents")
+    _add(Path.home() / "Desktop")
+    try:
+        for d in Path.home().iterdir():
+            try:
+                if d.is_dir() and d.name.lower() in {"projects", "repos", "代码", "训练", "train"}:
+                    _add(d)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return dirs
+
+
+def find_ckpt_files(search_dirs, since_hours=24):
     cutoff = datetime.now() - timedelta(hours=since_hours)
     found = []
-    for d in SEARCH_DIRS:
-        if not d or not d.exists():
-            continue
+    seen_paths = set()
+    for d in search_dirs:
         try:
-            for p in d.rglob("*"):
+            d_path = Path(d)
+            if not d_path.exists():
+                continue
+            for p in d_path.rglob("*"):
                 try:
                     if p.is_dir():
                         continue
-                    if p.stat().st_mtime < cutoff.timestamp():
+                    sp = str(p.resolve())
+                    if sp in seen_paths:
                         continue
                     lower = p.name.lower()
                     if not any(k in lower for k in CKPT_KEYWORDS):
                         continue
-                    size_mb = p.stat().st_size / 1024 / 1024
-                    if size_mb < 1 and "checkpoint" not in lower and "adapter" not in lower:
+                    try:
+                        st = p.stat()
+                        mtime = st.st_mtime
+                        if mtime < cutoff.timestamp():
+                            continue
+                        size_mb = float(st.st_size) / 1024.0 / 1024.0
+                    except Exception:
                         continue
-                    found.append((p, size_mb, datetime.fromtimestamp(p.stat().st_mtime)))
+                    if size_mb < 0.5 and "checkpoint" not in lower \
+                            and "adapter" not in lower and "safetensors" not in lower:
+                        continue
+                    found.append((p, size_mb, datetime.fromtimestamp(mtime)))
+                    seen_paths.add(sp)
                 except Exception:
                     pass
         except Exception:
             pass
     found.sort(key=lambda x: x[2], reverse=True)
-    return found
+    return found[:12]
 
 
-def fmt_duration(seconds):
-    if seconds is None or seconds < 0:
-        return "—"
-    s = int(seconds)
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    if h:
-        return f"{h}时{m}分{sec}秒"
-    if m:
-        return f"{m}分{sec}秒"
-    return f"{sec}秒"
-
-
-# ==================== GUI ====================
-
+# ======================================================================
+# GUI
+# ======================================================================
 class MonitorApp:
+    BG_DARK = "#1e1e2e"
+    BG_CARD = "#313244"
+    BG_HEADER = "#11111b"
+    BG_BAR = "#181825"
+    FG_MAIN = "#cdd6f4"
+    FG_SUB = "#a6adc8"
+    FG_ACCENT = "#f9e2af"
+    FG_BLUE = "#89b4fa"
+    FG_RED = "#f38ba8"
+    FG_GREEN = "#a6e3a1"
+    FG_ORANGE = "#fab387"
+    FG_PINK = "#f5c2e7"
+
     def __init__(self, root):
         self.root = root
-        self.root.title("训练实时监控")
-        self.root.geometry("780x620")
-        self.root.configure(bg="#1e1e2e")
-        self.root.minsize(720, 540)
-
-        # 字体
-        self.font_title = font.Font(family="Microsoft YaHei", size=16, weight="bold")
-        self.font_label = font.Font(family="Microsoft YaHei", size=11)
-        self.font_big = font.Font(family="Microsoft YaHei", size=24, weight="bold")
-        self.font_mono = font.Font(family="Consolas", size=10)
-
+        self.root.title("训练实时监控面板 v1.1.0")
+        self.root.geometry("900x680")
+        self.root.minsize(780, 580)
+        self.root.configure(bg=self.BG_DARK)
         self.start_time = datetime.now()
-        self.gpu_history = []  # 存最近的 GPU% 画小趋势图用
-        self.last_ckpt_count = -1
+        self.gpu_history = deque(maxlen=CHART_POINTS)
+
+        self.cfg = load_config()
+        self.custom_project_dir = self.cfg.get("project_dir", "")
         self._build_ui()
+        self.root.after(500, self.refresh)
 
-        # 首次刷新 + 启动循环
-        self.root.after(200, self.refresh)
-
-    # ---------- UI 构建 ----------
     def _build_ui(self):
-        # 顶部标题栏
-        header = tk.Frame(self.root, bg="#11111b", height=60)
+        # 顶部栏
+        header = tk.Frame(self.root, bg=self.BG_HEADER, height=72)
         header.pack(fill="x")
-        tk.Label(header, text="🔥 训练实时监控面板", fg="#f9e2af", bg="#11111b",
-                 font=self.font_title).pack(side="left", padx=20, pady=12)
-        self.lbl_time = tk.Label(header, text="", fg="#a6adc8", bg="#11111b",
-                                 font=self.font_label)
-        self.lbl_time.pack(side="right", padx=20, pady=12)
 
-        # 主体 = 左侧 GPU 卡片 + 右侧训练状态
-        body = tk.Frame(self.root, bg="#1e1e2e")
+        tk.Label(
+            header,
+            text="训练实时监控",
+            fg=self.FG_ACCENT,
+            bg=self.BG_HEADER,
+            font=("Microsoft YaHei", 16, "bold"),
+        ).pack(side="left", padx=20, pady=18)
+
+        dir_frame = tk.Frame(header, bg=self.BG_HEADER)
+        dir_frame.pack(side="right", padx=10, pady=12)
+        tk.Label(
+            dir_frame,
+            text="项目目录:",
+            fg=self.FG_SUB,
+            bg=self.BG_HEADER,
+            font=("Microsoft YaHei", 9),
+        ).pack(side="left")
+
+        display_text = self.custom_project_dir if self.custom_project_dir else "(自动检测)"
+        self.lbl_project = tk.Label(
+            dir_frame,
+            text=display_text,
+            fg=self.FG_BLUE,
+            bg=self.BG_DARK,
+            anchor="w",
+            width=48,
+            font=("Microsoft YaHei", 9),
+            padx=8,
+            pady=4,
+        )
+        self.lbl_project.pack(side="left", padx=6)
+
+        btn_choose = tk.Button(
+            dir_frame,
+            text="选择...",
+            command=self._on_choose_dir,
+            bg=self.BG_CARD,
+            fg=self.FG_MAIN,
+            relief="flat",
+            activebackground=self.BG_BAR,
+            borderwidth=0,
+            padx=12,
+            pady=4,
+            cursor="hand2",
+        )
+        btn_choose.pack(side="left", padx=4)
+        btn_auto = tk.Button(
+            dir_frame,
+            text="自动检测",
+            command=self._on_auto_detect,
+            bg=self.BG_CARD,
+            fg=self.FG_MAIN,
+            relief="flat",
+            activebackground=self.BG_BAR,
+            borderwidth=0,
+            padx=12,
+            pady=4,
+            cursor="hand2",
+        )
+        btn_auto.pack(side="left")
+
+        # 主体
+        body = tk.Frame(self.root, bg=self.BG_DARK)
         body.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # ===== 左侧：GPU 大卡 =====
-        left = tk.Frame(body, bg="#313244", padx=15, pady=15)
+        # ----- 左侧 GPU 卡片
+        left = tk.Frame(body, bg=self.BG_CARD, padx=15, pady=15)
         left.pack(side="left", fill="both", expand=True, padx=(0, 5))
 
-        tk.Label(left, text="GPU 状态", fg="#89b4fa", bg="#313244",
-                 font=self.font_label, anchor="w").pack(fill="x")
-        self.lbl_gpu_name = tk.Label(left, text="—", fg="#cdd6f4", bg="#313244",
-                                      font=("Microsoft YaHei", 12, "bold"), anchor="w")
+        tk.Label(
+            left,
+            text="GPU 状态",
+            fg=self.FG_BLUE,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 12, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        self.lbl_gpu_name = tk.Label(
+            left,
+            text="检测中...",
+            fg=self.FG_MAIN,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 11, "bold"),
+            anchor="w",
+            justify="left",
+        )
         self.lbl_gpu_name.pack(fill="x", pady=(2, 10))
 
-        # GPU 利用率
-        self.lbl_gpu_pct = tk.Label(left, text="--%", fg="#a6e3a1", bg="#313244",
-                                    font=self.font_big)
+        self.lbl_gpu_pct = tk.Label(
+            left, text="--%", fg=self.FG_GREEN, bg=self.BG_CARD,
+            font=("Microsoft YaHei", 26, "bold"),
+        )
         self.lbl_gpu_pct.pack(anchor="w", pady=(0, 4))
-        self.pb_gpu = self._mk_progress(left, total=100, color_fill="#a6e3a1")
+        self.pb_gpu = self._mk_progress(left, total=100, color_fill=self.FG_GREEN)
         self.pb_gpu.pack(fill="x", pady=(0, 12))
 
-        # 显存
-        row = tk.Frame(left, bg="#313244"); row.pack(fill="x", pady=4)
-        tk.Label(row, text="显存", fg="#fab387", bg="#313244",
-                 font=self.font_label, width=8, anchor="w").pack(side="left")
-        self.lbl_mem_text = tk.Label(row, text="-- / -- MB", fg="#cdd6f4",
-                                     bg="#313244", font=self.font_label)
-        self.lbl_mem_text.pack(side="left")
-        self.pb_mem = self._mk_progress(left, total=100, color_fill="#fab387")
-        self.pb_mem.pack(fill="x", pady=(4, 12))
+        tk.Label(
+            left,
+            text="显存 (已用 / 总量)",
+            fg=self.FG_ORANGE,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 10),
+            anchor="w",
+        ).pack(fill="x")
+        self.lbl_mem_text = tk.Label(
+            left,
+            text="-- / -- MB (--%)",
+            fg=self.FG_MAIN,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 11),
+        )
+        self.lbl_mem_text.pack(anchor="w", pady=(0, 4))
+        self.pb_mem = self._mk_progress(left, total=100, color_fill=self.FG_ORANGE)
+        self.pb_mem.pack(fill="x", pady=(0, 12))
 
-        # 温度 / 功耗
-        infos = tk.Frame(left, bg="#313244"); infos.pack(fill="x", pady=4)
-        self.lbl_temp = tk.Label(infos, text="温度: -- °C", fg="#f9e2af",
-                                 bg="#313244", font=self.font_label, anchor="w")
+        row = tk.Frame(left, bg=self.BG_CARD)
+        row.pack(fill="x", pady=4)
+        self.lbl_temp = tk.Label(
+            row,
+            text="温度: -- °C",
+            fg=self.FG_ACCENT,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 11),
+            anchor="w",
+        )
         self.lbl_temp.pack(side="left", expand=True, fill="x")
-        self.lbl_power = tk.Label(infos, text="功耗: -- / -- W", fg="#cba6f7",
-                                  bg="#313244", font=self.font_label, anchor="w")
+        self.lbl_power = tk.Label(
+            row,
+            text="功耗: -- / -- W",
+            fg="#cba6f7",
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 11),
+            anchor="w",
+        )
         self.lbl_power.pack(side="left", expand=True, fill="x")
 
-        # GPU 小趋势图（Canvas）
-        tk.Label(left, text="GPU 利用率趋势（最近 60 次刷新）",
-                 fg="#a6adc8", bg="#313244", font=("Microsoft YaHei", 9)).pack(
-            anchor="w", pady=(14, 2))
-        self.chart = tk.Canvas(left, height=80, bg="#181825", highlightthickness=0)
+        tk.Label(
+            left,
+            text="GPU 利用率趋势（最近 %d 次刷新）" % CHART_POINTS,
+            fg=self.FG_SUB,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 9),
+        ).pack(anchor="w", pady=(14, 2))
+        self.chart = tk.Canvas(left, height=90, bg=self.BG_BAR, highlightthickness=0)
         self.chart.pack(fill="x", pady=2)
+        self.chart.bind("<Configure>", lambda e: self._draw_chart())
 
-        # ===== 右侧：训练状态 + Checkpoint =====
-        right = tk.Frame(body, bg="#313244", padx=15, pady=15)
+        # ----- 右侧 训练状态
+        right = tk.Frame(body, bg=self.BG_CARD, padx=15, pady=15)
         right.pack(side="left", fill="both", expand=True, padx=(5, 0))
 
-        tk.Label(right, text="训练状态", fg="#89b4fa", bg="#313244",
-                 font=self.font_label, anchor="w").pack(fill="x")
-        self.lbl_runtime = tk.Label(right, text="已运行：--", fg="#a6e3a1",
-                                    bg="#313244", font=("Microsoft YaHei", 16, "bold"))
+        tk.Label(
+            right,
+            text="训练状态",
+            fg=self.FG_BLUE,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 12, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        self.lbl_runtime = tk.Label(
+            right,
+            text="已运行: --",
+            fg=self.FG_GREEN,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 14, "bold"),
+        )
         self.lbl_runtime.pack(anchor="w", pady=(4, 8))
 
-        tk.Label(right, text="进程列表", fg="#f5c2e7", bg="#313244",
-                 font=self.font_label, anchor="w").pack(fill="x", pady=(6, 2))
-        self.txt_procs = tk.Text(right, height=7, bg="#181825", fg="#cdd6f4",
-                                 font=self.font_mono, relief="flat", padx=8, pady=6)
+        tk.Label(
+            right,
+            text="进程列表",
+            fg=self.FG_PINK,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 11),
+            anchor="w",
+        ).pack(fill="x", pady=(6, 2))
+        self.txt_procs = tk.Text(
+            right,
+            height=6,
+            bg=self.BG_BAR,
+            fg=self.FG_MAIN,
+            font=("Consolas", 10),
+            relief="flat",
+            wrap="word",
+        )
         self.txt_procs.pack(fill="x")
 
-        tk.Label(right, text="Checkpoint / 模型输出（最近 24 小时）",
-                 fg="#f5c2e7", bg="#313244", font=self.font_label, anchor="w").pack(
-            fill="x", pady=(12, 2))
-        self.txt_ckpt = tk.Text(right, height=8, bg="#181825", fg="#cdd6f4",
-                                font=self.font_mono, relief="flat", padx=8, pady=6)
+        tk.Label(
+            right,
+            text="Checkpoint / 模型输出（最近 24 小时）",
+            fg=self.FG_PINK,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 11),
+            anchor="w",
+        ).pack(fill="x", pady=(12, 2))
+        self.txt_ckpt = tk.Text(
+            right,
+            height=9,
+            bg=self.BG_BAR,
+            fg=self.FG_MAIN,
+            font=("Consolas", 10),
+            relief="flat",
+            wrap="word",
+        )
         self.txt_ckpt.pack(fill="both", expand=True, pady=(0, 4))
 
-        # ===== 底部：状态条 + 警告 =====
-        bottom = tk.Frame(self.root, bg="#11111b", height=38)
+        # 底部状态栏
+        bottom = tk.Frame(self.root, bg=self.BG_HEADER, height=40)
         bottom.pack(fill="x", side="bottom")
-        self.lbl_status = tk.Label(bottom, text="● 监控中", fg="#a6e3a1",
-                                   bg="#11111b", font=self.font_label)
-        self.lbl_status.pack(side="left", padx=16, pady=8)
-        self.lbl_warn = tk.Label(bottom, text="", fg="#f38ba8", bg="#11111b",
-                                 font=("Microsoft YaHei", 10, "bold"))
-        self.lbl_warn.pack(side="right", padx=16, pady=8)
-        self.lbl_monitor_uptime = tk.Label(bottom, text="", fg="#a6adc8",
-                                           bg="#11111b", font=self.font_label)
-        self.lbl_monitor_uptime.pack(side="right", padx=16, pady=8)
+        self.lbl_status = tk.Label(
+            bottom,
+            text="监控中",
+            fg=self.FG_GREEN,
+            bg=self.BG_HEADER,
+            font=("Microsoft YaHei", 10),
+        )
+        self.lbl_status.pack(side="left", padx=16, pady=10)
+        self.lbl_warn = tk.Label(
+            bottom,
+            text="",
+            fg=self.FG_RED,
+            bg=self.BG_HEADER,
+            font=("Microsoft YaHei", 10, "bold"),
+            wraplength=600,
+            justify="left",
+        )
+        self.lbl_warn.pack(side="right", padx=16, pady=10)
+        self.lbl_monitor_uptime = tk.Label(
+            bottom,
+            text="",
+            fg=self.FG_SUB,
+            bg=self.BG_HEADER,
+            font=("Microsoft YaHei", 10),
+        )
+        self.lbl_monitor_uptime.pack(side="right", padx=16, pady=10)
 
-    def _mk_progress(self, parent, total, color_fill, height=18):
-        """自定义进度条（因为 ttk 进度条在暗色主题里不好看）"""
-        canvas = tk.Canvas(parent, height=height, bg="#181825",
+    def _mk_progress(self, parent, total, color_fill, height=16):
+        canvas = tk.Canvas(parent, height=height, bg=self.BG_BAR,
                            highlightthickness=0, bd=0)
         canvas._total = total
         canvas._color = color_fill
-        canvas._fill_id = None
-        canvas.bind("<Configure>",
-                    lambda e: self._draw_progress(canvas, getattr(canvas, "_value", 0)))
-        setattr(canvas, "_value", 0)
+        canvas._value = 0.0
+        canvas.bind("<Configure>", lambda e: self._draw_progress(canvas))
         return canvas
 
-    def _draw_progress(self, canvas, value):
+    def _draw_progress(self, canvas):
         canvas.delete("all")
         w = canvas.winfo_width() or 200
-        h = canvas.winfo_height() or 18
-        ratio = max(0.0, min(1.0, value / canvas._total))
+        h = canvas.winfo_height() or 16
+        ratio = max(0.0, min(1.0, getattr(canvas, "_value", 0) / canvas._total))
         fill_w = int(w * ratio)
-        # 圆角背景
-        canvas.create_rectangle(0, 0, w, h, fill="#181825", outline="")
-        # 填充条
+        canvas.create_rectangle(0, 0, w, h, fill=self.BG_BAR, outline="")
         if fill_w > 0:
             canvas.create_rectangle(0, 0, fill_w, h, fill=canvas._color, outline="")
-        # 百分比文字
-        canvas.create_text(w - 8, h / 2, text=f"{value:.0f}%",
-                           fill="#cdd6f4", anchor="e",
-                           font=("Microsoft YaHei", 9, "bold"))
+        canvas.create_text(
+            w - 8, h / 2,
+            text="%.0f%%" % getattr(canvas, "_value", 0),
+            fill=self.FG_MAIN,
+            anchor="e",
+            font=("Microsoft YaHei", 9, "bold"),
+        )
 
-    # ---------- 刷新逻辑 ----------
+    def _on_choose_dir(self):
+        d = filedialog.askdirectory(title="选择项目根目录（训练脚本所在目录）")
+        if d:
+            self.custom_project_dir = d
+            self.lbl_project.config(text=d)
+            cfg = load_config()
+            cfg["project_dir"] = d
+            save_config(cfg)
+            messagebox.showinfo(
+                "已保存",
+                "项目目录已设置为：\n%s\n\n下次启动将自动使用此目录。" % d,
+            )
+
+    def _on_auto_detect(self):
+        self.custom_project_dir = ""
+        cfg = load_config()
+        cfg.pop("project_dir", None)
+        save_config(cfg)
+        self.lbl_project.config(text="(自动检测)")
+
+    # ---------- 刷新逻辑
     def refresh(self):
-        # 跑在子线程里拿数据，避免卡 UI
         t = threading.Thread(target=self._collect_and_update, daemon=True)
         t.start()
 
     def _collect_and_update(self):
+        gpu_info = None
+        procs = []
+        ckpts = []
+        dirs_searched = []
         try:
-            gpu = get_gpu_info()
-            procs = list_training_processes()
-            ckpts = find_ckpt_files(since_hours=24)
-            # 回主线程更新 UI
-            self.root.after(0, lambda: self._update_ui(gpu, procs, ckpts))
+            gpu_info = get_gpu_info()
         except Exception as e:
-            self.root.after(0, lambda: self.lbl_status.config(
-                text=f"⚠ 刷新失败: {e}", fg="#f38ba8"))
+            gpu_info = {"error": "GPU 检测异常: %s" % e}
+        try:
+            procs = list_training_processes()
+        except Exception:
+            procs = []
+        try:
+            if self.custom_project_dir:
+                dirs_searched = [Path(self.custom_project_dir)]
+            else:
+                dirs_searched = detect_project_dirs()
+            ckpts = find_ckpt_files(dirs_searched, since_hours=24)
+        except Exception:
+            ckpts = []
+        try:
+            self.root.after(
+                0,
+                lambda: self._update_ui(gpu_info, procs, ckpts, dirs_searched),
+            )
         finally:
-            # 下一轮刷新
             self.root.after(REFRESH_MS, self.refresh)
 
-    def _update_ui(self, gpu, procs, ckpts):
+    def _update_ui(self, gpu, procs, ckpts, dirs_searched):
         now = datetime.now()
-        self.lbl_time.config(text=now.strftime("%Y-%m-%d %H:%M:%S"))
-
-        # 监控运行时长
         up = fmt_duration((now - self.start_time).total_seconds())
-        self.lbl_monitor_uptime.config(text=f"监控运行: {up}")
+        self.lbl_monitor_uptime.config(text="监控运行: %s" % up)
 
         warnings = []
 
         # GPU
         if gpu and gpu.get("error"):
-            # 检测失败：显示友好提示
-            self.lbl_gpu_name.config(text="⚠ GPU 检测失败", fg="#f38ba8")
-            self.lbl_gpu_pct.config(text="--%", fg="#a6adc8")
-            self._draw_progress(self.pb_gpu, 0)
+            self.lbl_gpu_name.config(
+                text="GPU 检测失败\n" + gpu["error"],
+                fg=self.FG_RED,
+            )
+            self.lbl_gpu_pct.config(text="--%", fg=self.FG_SUB)
+            self.pb_gpu._value = 0.0
+            self._draw_progress(self.pb_gpu)
             self.lbl_mem_text.config(text="(无法读取)")
-            self._draw_progress(self.pb_mem, 0)
-            self.lbl_temp.config(text="温度: -- °C")
+            self.pb_mem._value = 0.0
+            self._draw_progress(self.pb_mem)
+            self.lbl_temp.config(text="温度: -- C")
             self.lbl_power.config(text="功耗: -- / -- W")
-            warnings.append("⚠ " + gpu["error"])
-        elif gpu and "name" in gpu and gpu.get("name"):
-            self.lbl_gpu_name.config(text=gpu["name"])
+            warnings.append("GPU 检测失败")
+        elif gpu and gpu.get("name"):
+            cnt = gpu.get("gpu_count", 1)
+            name_text = gpu["name"]
+            if cnt > 1:
+                name_text = "%s (共 %d 张卡)" % (name_text, cnt)
+            self.lbl_gpu_name.config(text=name_text, fg=self.FG_MAIN)
             util = gpu["gpu_util"]
-            self.lbl_gpu_pct.config(text=f"{util:.0f}%")
-            self._draw_progress(self.pb_gpu, util)
-
+            self.lbl_gpu_pct.config(text="%.0f%%" % util, fg=self.FG_GREEN)
+            self.pb_gpu._value = util
+            self._draw_progress(self.pb_gpu)
             mem_pct = gpu["mem_used_mb"] / max(gpu["mem_total_mb"], 1) * 100
             self.lbl_mem_text.config(
-                text=f"{gpu['mem_used_mb']:.0f} / {gpu['mem_total_mb']:.0f} MB  ({mem_pct:.1f}%)")
-            self._draw_progress(self.pb_mem, mem_pct)
+                text="%.0f / %.0f MB (%.1f%%)" % (
+                    gpu["mem_used_mb"], gpu["mem_total_mb"], mem_pct,
+                )
+            )
+            self.pb_mem._value = mem_pct
+            self._draw_progress(self.pb_mem)
             if mem_pct > 95:
-                warnings.append(f"⚠ 显存 {mem_pct:.0f}%，有 OOM 风险")
-
-            self.lbl_temp.config(text=f"温度: {gpu['temp_c']:.0f} °C")
+                warnings.append("显存 %.0f%%，有 OOM 风险" % mem_pct)
+            self.lbl_temp.config(text="温度: %.0f C" % gpu["temp_c"])
             if gpu["temp_c"] > 85:
-                warnings.append(f"🌡 温度 {gpu['temp_c']:.0f}°C 偏高")
-            self.lbl_power.config(text=f"功耗: {gpu['power_w']} / {gpu['power_limit_w']} W")
-
-            # 记录趋势（最多 60 个点）
+                warnings.append("温度 %.0fC 偏高" % gpu["temp_c"])
+            self.lbl_power.config(
+                text="功耗: %s / %s W" % (gpu["power_w"], gpu["power_limit_w"])
+            )
             self.gpu_history.append(util)
-            if len(self.gpu_history) > 60:
-                self.gpu_history = self.gpu_history[-60:]
             self._draw_chart()
-        else:
-            self.lbl_gpu_name.config(text="未检测到 GPU", fg="#f38ba8")
-            warnings.append("⚠ 未检测到 GPU（请确认是否为 NVIDIA 显卡且已安装驱动")
 
-        # 进程 + 运行时长
+        # 进程
         if procs:
             self.txt_procs.config(state="normal")
             self.txt_procs.delete("1.0", "end")
-            # 找主进程（CPU最高的那个）
             main_p = max(procs, key=lambda p: p.get("cpu_s", 0))
             try:
                 st = datetime.strptime(main_p["start_time"], "%Y/%m/%d %H:%M:%S")
                 runtime = fmt_duration((datetime.now() - st).total_seconds())
-                self.lbl_runtime.config(text=f"已运行 {runtime}", fg="#a6e3a1")
+                self.lbl_runtime.config(text="已运行 %s" % runtime, fg=self.FG_GREEN)
             except Exception:
-                self.lbl_runtime.config(text="已运行（未知）", fg="#f38ba8")
-
-            # 排序（按 CPU 时间倒序）
-            procs_sorted = sorted(procs, key=lambda p: p.get("cpu_s", 0), reverse=True)
-            for p in procs_sorted:
+                self.lbl_runtime.config(text="已运行 (未知)", fg=self.FG_RED)
+            for p in sorted(procs, key=lambda p: p.get("cpu_s", 0), reverse=True):
                 try:
                     st = datetime.strptime(p["start_time"], "%Y/%m/%d %H:%M:%S")
                     rt = fmt_duration((datetime.now() - st).total_seconds())
                 except Exception:
-                    rt = "—"
-                line = (f"  PID {p['pid']:>6}  {p['name']:<18} "
-                        f"内存 {p['mem_mb']:>7.0f} MB  CPU {p['cpu_s']/60:>5.1f} 分  "
-                        f"运行 {rt}\n")
+                    rt = "-"
+                line = (
+                    "  PID %6s  %-22s  内存 %7.0f MB  CPU %5.1f 分  运行 %s\n"
+                    % (p["pid"], p["name"], p["mem_mb"], p["cpu_s"] / 60.0, rt)
+                )
                 self.txt_procs.insert("end", line)
             self.txt_procs.config(state="disabled")
-            self.lbl_status.config(text="● 监控中 · 训练正常", fg="#a6e3a1")
+            self.lbl_status.config(text="监控中 - 训练正常", fg=self.FG_GREEN)
         else:
-            self.lbl_runtime.config(text="没找到训练进程！", fg="#f38ba8")
+            self.lbl_runtime.config(text="未找到训练进程", fg=self.FG_RED)
             self.txt_procs.config(state="normal")
             self.txt_procs.delete("1.0", "end")
-            self.txt_procs.insert("end", "  ❌ 没有 python / weclone 进程 —— 训练可能已经停了")
+            self.txt_procs.insert(
+                "end",
+                "  未发现 python / weclone 训练进程。\n"
+                "  如果训练已停止或尚未启动，这是正常现象。\n"
+                "  （你也可以在顶部手动指定项目目录来搜索 checkpoint）",
+            )
             self.txt_procs.config(state="disabled")
-            self.lbl_status.config(text="⚠ 未发现训练进程", fg="#f38ba8")
-            warnings.append("❌ 训练进程未找到")
+            self.lbl_status.config(text="未发现训练进程", fg=self.FG_RED)
+            warnings.append("未发现训练进程")
 
-        # Checkpoint 列表
+        # Checkpoint
         self.txt_ckpt.config(state="normal")
         self.txt_ckpt.delete("1.0", "end")
         if not ckpts:
-            self.txt_ckpt.insert("end",
-                "  ⏳ 还没有 checkpoint / adapter 输出文件，训练还在跑第一个周期...\n"
-                "     （通常每训练完一个 epoch 或固定步数才会保存一次）")
+            hint = "  尚未发现 checkpoint / adapter 输出文件。\n"
+            hint += "  （训练可能还未完成第一次保存，或尚未开始训练。）\n"
+            hint += "  搜索目录: " + "、".join(str(d) for d in (dirs_searched or []))
+            self.txt_ckpt.insert("end", hint)
         else:
-            for p, size_mb, mtime in ckpts[:8]:
-                self.txt_ckpt.insert("end",
-                    f"  [{mtime.strftime('%H:%M:%S')}]  {size_mb:>7.2f} MB   {p}\n")
-            if len(ckpts) > 8:
-                self.txt_ckpt.insert("end", f"  ... 还有 {len(ckpts) - 8} 个\n")
-            if self.last_ckpt_count >= 0 and len(ckpts) > self.last_ckpt_count:
-                self.lbl_status.config(
-                    text=f"✨ 新增 checkpoint! 现在共 {len(ckpts)} 个", fg="#f9e2af")
-        self.last_ckpt_count = len(ckpts)
+            for p, size_mb, mtime in ckpts:
+                self.txt_ckpt.insert(
+                    "end",
+                    "  [%s]  %7.2f MB   %s\n" % (
+                        mtime.strftime("%H:%M:%S"), size_mb, str(p),
+                    ),
+                )
+            if len(ckpts) > 12:
+                self.txt_ckpt.insert("end", "  ... 还有更多未展示\n")
         self.txt_ckpt.config(state="disabled")
 
-        # 警告
         self.lbl_warn.config(text="  ".join(warnings))
 
-    # ---------- 画小趋势图 ----------
     def _draw_chart(self):
         self.chart.delete("all")
         w = self.chart.winfo_width() or 300
-        h = self.chart.winfo_height() or 80
+        h = self.chart.winfo_height() or 90
         if len(self.gpu_history) < 2:
             return
-        data = self.gpu_history
+        data = list(self.gpu_history)
         n = len(data)
-        # Y = 100 - value（越高利用率越靠上）；X 从右往左画最新在最右
         step = max(1, w // max(n, 1))
-        # 先画一条基准线
         self.chart.create_line(0, h - 1, w, h - 1, fill="#45475a", width=1)
-        # 画填充折线
         points = []
         for i, v in enumerate(data):
             x = i * step
-            y = int(h - 2 - (h - 4) * v / 100)
+            y = int(h - 2 - (h - 4) * v / 100.0)
             points.extend([x, y])
-        # 画填充区（从底部到折线）
         fill_pts = [0, h - 2] + points + [(n - 1) * step, h - 2]
         if len(fill_pts) >= 6:
             try:
-                self.chart.create_polygon(fill_pts, fill="#a6e3a1",
-                                          outline="", stipple="gray25")
+                self.chart.create_polygon(
+                    fill_pts, fill=self.FG_GREEN, outline="", stipple="gray25"
+                )
             except Exception:
                 pass
-        # 折线
         if len(points) >= 4:
-            self.chart.create_line(*points, fill="#a6e3a1", width=2, smooth=True)
+            try:
+                self.chart.create_line(
+                    *points, fill=self.FG_GREEN, width=2, smooth=True
+                )
+            except Exception:
+                pass
 
 
 def main():
     root = tk.Tk()
-    # 试一下让 DPI 更清晰（Win10+）
     try:
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)
