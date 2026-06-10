@@ -15,52 +15,175 @@ import tkinter as tk
 from tkinter import ttk, font
 
 # ======== 配置 ========
-PROJECT_DIR = Path(r"d:\netease\Downloads\11111\数字人克隆-云训练完整包-20260610")
+# 把项目所在目录自动识别为当前脚本所在目录（不再写死路径）
+_PROJECT_ROOT = Path(__file__).resolve().parent
 REFRESH_MS = 3000   # 每 3 秒刷新一次
 SEARCH_DIRS = [
-    PROJECT_DIR,
-    PROJECT_DIR / "WeClone",
-    PROJECT_DIR / "output",
+    _PROJECT_ROOT,
+    _PROJECT_ROOT.parent,
+    Path.home() / "Documents",
     Path.home() / ".cache" / "huggingface",
 ]
 CKPT_KEYWORDS = ["checkpoint", "adapter", "safetensors", "pytorch_model",
                  "optimizer", "rng_state", "trainer_state", "training_args",
                  "weclone", "sft", "lora", "adapter_model"]
+
+# nvidia-smi 的常见安装路径（Windows）
+_NVIDIA_SMI_CANDIDATES_WIN = [
+    r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+    r"C:\Windows\System32\nvidia-smi.exe",
+    r"C:\Windows\SysWOW64\nvidia-smi.exe",
+]
+# NVIDIA 驱动目录会随大版本号变化，通过枚举 C:\Program Files\NVIDIA Corporation\ 找 NVSMI 目录
+_NVIDIA_ROOT = Path(r"C:\Program Files\NVIDIA Corporation")
+
+# 缓存 nvidia-smi 路径，避免每次刷新都去扫描
+_CACHED_NVIDIA_SMI = None
 # =====================
+
+
+def find_nvidia_smi():
+    """
+    找到 nvidia-smi 可执行文件的完整路径。
+    优先顺序：PATH -> 常见安装路径 -> 扫描 C:/Program Files/NVIDIA Corporation/
+    返回 (path_or_None, message)
+    """
+    global _CACHED_NVIDIA_SMI
+    if _CACHED_NVIDIA_SMI and Path(_CACHED_NVIDIA_SMI).exists():
+        return _CACHED_NVIDIA_SMI, "ok"
+
+    # 1) PATH
+    import shutil
+    found = shutil.which("nvidia-smi")
+    if found:
+        _CACHED_NVIDIA_SMI = found
+        return found, "ok"
+
+    # 2) 常见固定路径
+    for p in _NVIDIA_SMI_CANDIDATES_WIN:
+        if Path(p).exists():
+            _CACHED_NVIDIA_SMI = p
+            return p, "ok"
+
+    # 3) 扫描 C:\Program Files\NVIDIA Corporation 下所有 *NVSMI* 目录
+    try:
+        if _NVIDIA_ROOT.exists():
+            for sub in _NVIDIA_ROOT.iterdir():
+                if sub.is_dir() and "NVSMI" in sub.name.upper():
+                    candidate = sub / "nvidia-smi.exe"
+                    if candidate.exists():
+                        _CACHED_NVIDIA_SMI = str(candidate)
+                        return str(candidate), "ok"
+    except Exception:
+        pass
+
+    return None, (
+        "未找到 nvidia-smi。请确认：\n"
+        "  1) 电脑已安装 NVIDIA 显卡驱动\n"
+        "  2) C:/Program Files/NVIDIA Corporation/.../NVSMI/ 目录下存在 nvidia-smi.exe\n"
+        "  3) 或者把 nvidia-smi 所在目录加入系统环境变量 PATH"
+    )
 
 
 def run_cmd(cmd, timeout=5):
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True,
-                           text=True, timeout=timeout, errors="ignore")
+        # 传进来的可能是 list（推荐，避免 shell 解析问题）
+        if isinstance(cmd, (list, tuple)):
+            r = subprocess.run(list(cmd), shell=False, capture_output=True,
+                               text=True, timeout=timeout, errors="ignore")
+        else:
+            r = subprocess.run(cmd, shell=True, capture_output=True,
+                               text=True, timeout=timeout, errors="ignore")
         return r.stdout.strip()
     except Exception:
         return ""
 
 
 def get_gpu_info():
-    out = run_cmd(
-        'nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,'
-        'temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits'
-    )
+    """
+    检测 GPU 状态。
+    返回 {"name", "gpu_util", "mem_used_mb", "mem_total_mb",
+          "temp_c", "power_w", "power_limit_w", "gpu_count", "error"}
+    任一失败时，error 字段会包含用户可读的中文错误提示。
+    """
+    smi_path, msg = find_nvidia_smi()
+    if smi_path is None:
+        return {"error": msg}
+
+    # 多 GPU 环境：每行一块卡，取总利用率/总显存/平均温度/第一张卡的名字
+    out = run_cmd([
+        smi_path,
+        "--query-gpu=name,utilization.gpu,memory.used,memory.total,"
+        "temperature.gpu,power.draw,power.limit,count",
+        "--format=csv,noheader,nounits"
+    ])
     if not out:
-        return None
+        # 再试一次不带 count（部分老驱动不支持）
+        out = run_cmd([
+            smi_path,
+            "--query-gpu=name,utilization.gpu,memory.used,memory.total,"
+            "temperature.gpu,power.draw,power.limit",
+            "--format=csv,noheader,nounits"
+        ])
+        if not out:
+            return {"error": "nvidia-smi 已找到但无输出，请检查驱动状态。"}
+
     lines = [l for l in out.splitlines() if l.strip()]
     if not lines:
-        return None
-    parts = [p.strip() for p in lines[0].split(",")]
-    try:
+        return {"error": "未检测到 NVIDIA GPU。"}
+
+    gpus = []
+    for line in lines:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 7:
+            continue
+        try:
+            gpus.append({
+                "name": parts[0],
+                "gpu_util": float(parts[1]) if parts[1] else 0.0,
+                "mem_used_mb": float(parts[2]) if parts[2] else 0.0,
+                "mem_total_mb": float(parts[3]) if parts[3] else 0.0,
+                "temp_c": float(parts[4]) if parts[4] else 0.0,
+                "power_w": parts[5] if parts[5] else "?",
+                "power_limit_w": parts[6] if parts[6] else "?",
+            })
+        except (ValueError, IndexError):
+            continue
+
+    if not gpus:
+        return {"error": "nvidia-smi 输出异常，无法解析。"}
+
+    # 汇总：若有多 GPU，展示总利用率/总显存
+    if len(gpus) == 1:
+        g = gpus[0]
         return {
-            "name": parts[0],
-            "gpu_util": float(parts[1]) if parts[1] else 0.0,
-            "mem_used_mb": float(parts[2]) if parts[2] else 0.0,
-            "mem_total_mb": float(parts[3]) if parts[3] else 0.0,
-            "temp_c": float(parts[4]) if parts[4] else 0.0,
-            "power_w": parts[5] if len(parts) > 5 and parts[5] else "?",
-            "power_limit_w": parts[6] if len(parts) > 6 and parts[6] else "?",
+            "name": g["name"],
+            "gpu_util": g["gpu_util"],
+            "mem_used_mb": g["mem_used_mb"],
+            "mem_total_mb": g["mem_total_mb"],
+            "temp_c": g["temp_c"],
+            "power_w": g["power_w"],
+            "power_limit_w": g["power_limit_w"],
+            "gpu_count": 1,
+            "error": None,
         }
-    except (IndexError, ValueError):
-        return None
+    # 多 GPU：汇总
+    total_util = sum(g["gpu_util"] for g in gpus) / len(gpus)
+    total_mem_used = sum(g["mem_used_mb"] for g in gpus)
+    total_mem_total = sum(g["mem_total_mb"] for g in gpus)
+    avg_temp = sum(g["temp_c"] for g in gpus) / len(gpus)
+    names = "，".join(g["name"] for g in gpus[:2]) + (f" 等 {len(gpus)} 张卡" if len(gpus) > 2 else "")
+    return {
+        "name": names,
+        "gpu_util": total_util,
+        "mem_used_mb": total_mem_used,
+        "mem_total_mb": total_mem_total,
+        "temp_c": avg_temp,
+        "power_w": "见各卡",
+        "power_limit_w": "见各卡",
+        "gpu_count": len(gpus),
+        "error": None,
+    }
 
 
 def list_training_processes():
@@ -359,7 +482,17 @@ class MonitorApp:
         warnings = []
 
         # GPU
-        if gpu:
+        if gpu and gpu.get("error"):
+            # 检测失败：显示友好提示
+            self.lbl_gpu_name.config(text="⚠ GPU 检测失败", fg="#f38ba8")
+            self.lbl_gpu_pct.config(text="--%", fg="#a6adc8")
+            self._draw_progress(self.pb_gpu, 0)
+            self.lbl_mem_text.config(text="(无法读取)")
+            self._draw_progress(self.pb_mem, 0)
+            self.lbl_temp.config(text="温度: -- °C")
+            self.lbl_power.config(text="功耗: -- / -- W")
+            warnings.append("⚠ " + gpu["error"])
+        elif gpu and "name" in gpu and gpu.get("name"):
             self.lbl_gpu_name.config(text=gpu["name"])
             util = gpu["gpu_util"]
             self.lbl_gpu_pct.config(text=f"{util:.0f}%")
@@ -382,6 +515,9 @@ class MonitorApp:
             if len(self.gpu_history) > 60:
                 self.gpu_history = self.gpu_history[-60:]
             self._draw_chart()
+        else:
+            self.lbl_gpu_name.config(text="未检测到 GPU", fg="#f38ba8")
+            warnings.append("⚠ 未检测到 GPU（请确认是否为 NVIDIA 显卡且已安装驱动")
 
         # 进程 + 运行时长
         if procs:
