@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-训练实时监控面板 v1.1.0
+训练实时监控面板 v1.2.0
 
 核心特性:
   - 自动检测 NVIDIA GPU（nvidia-smi 多级搜索）
-  - 自动发现训练进程（Python / WeClone / 命令行关键词）
-  - 自动定位项目目录（用户可手动选择，设置持久化）
-  - 友好错误诊断：三路独立检测，任一失败不影响其他
+  - 自动发现训练进程（Python / WeClone / 自定义关键词）
+  - 自动定位 model_output 目录并解析 trainer_log.jsonl
+  - 实时显示训练进度、loss、学习率、剩余时间（倒计时）
+  - 用户可手动选择项目目录，配置持久化
+  - 友好错误诊断：五路独立检测，任一失败不影响其他
   - 零外部依赖：仅标准库 + tkinter
 """
 import os
@@ -48,6 +50,10 @@ _NVIDIA_SMI_CANDIDATES = [
     r"C:\Windows\System32\nvidia-smi.exe",
     r"C:\Windows\SysWOW64\nvidia-smi.exe",
 ]
+
+# 训练日志文件名（LLaMA Factory 生成）
+_TRAINER_LOG_NAME = "trainer_log.jsonl"
+_OUTPUT_DIR_CANDIDATES = ["model_output", "output", "outputs", "checkpoints", "ckpt"]
 
 
 # ======================================================================
@@ -352,9 +358,333 @@ def list_training_processes():
 
 
 # ======================================================================
+# 训练日志解析 + model_output 定位
+# ======================================================================
+def _parse_hms(s):
+    """解析 'H:MM:SS' 或 'HH:MM:SS' 字符串为秒数"""
+    try:
+        parts = s.strip().split(":")
+        if len(parts) == 3:
+            h, m, sec = parts
+            return int(h) * 3600 + int(m) * 60 + int(sec)
+        if len(parts) == 2:
+            m, sec = parts
+            return int(m) * 60 + int(sec)
+    except Exception:
+        pass
+    return None
+
+
+def _format_hms(total_seconds):
+    if total_seconds is None or total_seconds < 0:
+        return "--:--:--"
+    total = int(total_seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return "%02d:%02d:%02d" % (h, m, s)
+
+
+def find_trainer_log(base_dirs):
+    """在多个目录下查找 trainer_log.jsonl。返回路径或 None，并附带最后一次修改时间"""
+    candidates = []
+    for d in base_dirs:
+        try:
+            p = Path(d)
+            if not p.exists():
+                continue
+            # 直接搜
+            f = p / _TRAINER_LOG_NAME
+            if f.exists():
+                candidates.append(f)
+            # 在子目录里搜
+            for subname in _OUTPUT_DIR_CANDIDATES:
+                sub = p / subname
+                if sub.exists():
+                    ff = sub / _TRAINER_LOG_NAME
+                    if ff.exists():
+                        candidates.append(ff)
+                    # 再深一层
+                    for deep in sub.rglob(_TRAINER_LOG_NAME):
+                        candidates.append(deep)
+            # 深度搜索
+            try:
+                for deep in p.rglob(_TRAINER_LOG_NAME):
+                    candidates.append(deep)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    if not candidates:
+        return None
+    # 去重 + 选最新修改的
+    seen = set()
+    uniq = []
+    for c in candidates:
+        try:
+            k = str(c.resolve())
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(c)
+        except Exception:
+            pass
+    uniq.sort(key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True)
+    return uniq[0]
+
+
+def parse_training_progress(log_path, history_max=30):
+    """
+    解析 trainer_log.jsonl，返回最新训练进度数据。
+    - 会区分不同 total_steps 的运行，取"最新一次运行"的最新记录
+    - 返回 dict: {latest_rows, log_path, error, current_steps, total_steps, percentage,
+                   elapsed_time, remaining_time, elapsed_sec, remaining_sec,
+                   loss, lr, epoch, it_s, etas, finish_time_est}
+    """
+    try:
+        lp = Path(log_path)
+        if not lp.exists():
+            return {"error": "未找到 trainer_log.jsonl", "log_path": str(lp)}
+
+        rows = []
+        with open(str(lp), "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+
+        if not rows:
+            return {"error": "trainer_log.jsonl 为空", "log_path": str(lp)}
+
+        # 按 total_steps 分组（不同训练运行可能混在一个文件里）
+        groups = {}
+        for r in rows:
+            try:
+                ts = r["total_steps"]
+                groups.setdefault(ts, []).append(r)
+            except Exception:
+                pass
+
+        if not groups:
+            return {"error": "日志格式异常（缺 total_steps）", "log_path": str(lp)}
+
+        # 选最新一组：按各组最后一条记录的 current_steps 最大的那个
+        best_key = max(groups.keys(), key=lambda k: groups[k][-1].get("current_steps", 0))
+        latest_rows = groups[best_key]
+
+        last = latest_rows[-1]
+        # 基础字段
+        current_steps = int(last.get("current_steps", 0))
+        total_steps = int(last.get("total_steps", 0))
+        percentage = float(last.get("percentage", 0))
+        loss = float(last.get("loss", 0))
+        lr = float(last.get("lr", 0))
+        epoch = float(last.get("epoch", 0)) if last.get("epoch") is not None else 0
+
+        # 解析 elapsed_time / remaining_time 字符串
+        elapsed_sec = _parse_hms(last.get("elapsed_time", "")) or 0
+        remaining_sec = _parse_hms(last.get("remaining_time", "")) or None
+
+        # 计算 it/s（取最近 30 条 + 第一条做基准，排除冷启动阶段的速度波动）
+        it_s = None
+        etas = None
+        if len(latest_rows) >= 2:
+            try:
+                # 用第一条 vs 最后一条算整体平均速度
+                steps_delta = int(latest_rows[-1]["current_steps"]) - int(latest_rows[0]["current_steps"])
+                t0 = _parse_hms(latest_rows[0].get("elapsed_time", "")) or 0
+                t1 = _parse_hms(latest_rows[-1].get("elapsed_time", "")) or 0
+                time_delta = t1 - t0
+                if steps_delta > 0 and time_delta > 0:
+                    it_s = steps_delta / time_delta
+                    remaining_steps = total_steps - current_steps
+                    if it_s > 0:
+                        etas = remaining_steps / it_s
+            except Exception:
+                pass
+
+        # 估算结束时间（本地时间）
+        finish_time_est = None
+        if etas:
+            try:
+                finish_time_est = datetime.now() + timedelta(seconds=etas)
+            except Exception:
+                pass
+
+        # 最近 history_max 条 loss/百分比，用于趋势
+        history = []
+        for r in latest_rows[-history_max:]:
+            try:
+                history.append({
+                    "percentage": float(r.get("percentage", 0)),
+                    "loss": float(r.get("loss", 0)),
+                    "lr": float(r.get("lr", 0)),
+                    "elapsed": _parse_hms(r.get("elapsed_time", "")) or 0,
+                })
+            except Exception:
+                continue
+
+        return {
+            "error": None,
+            "log_path": str(lp),
+            "current_steps": current_steps,
+            "total_steps": total_steps,
+            "percentage": percentage,
+            "elapsed_time": last.get("elapsed_time", "--"),
+            "remaining_time": last.get("remaining_time", "--"),
+            "elapsed_sec": elapsed_sec,
+            "remaining_sec": remaining_sec,
+            "loss": loss,
+            "lr": lr,
+            "epoch": epoch,
+            "it_s": it_s,
+            "etas": etas,
+            "finish_time_est": finish_time_est,
+            "history": history,
+            "total_rows": len(latest_rows),
+        }
+    except Exception as e:
+        return {"error": "解析日志异常: %s" % e, "log_path": str(log_path)}
+
+
+# ======================================================================
 # 项目目录识别 + Checkpoint 搜索
 # ======================================================================
-def detect_project_dirs():
+def _scan_dir_for_projects(base_path, max_depth=3, max_total=30):
+    """在 base_path 下搜索可能的项目目录（含"数字人/weclone/train/model_output"等关键词）
+    - 无论是否匹配关键词，都继续向下（最大 max_depth）
+    - 匹配关键词的目录加入结果
+    - 结果数量限制 max_total，避免在大型目录下太慢
+    """
+    results = []
+    try:
+        base = Path(base_path)
+        if not base.exists():
+            return results
+        # 检查 base 自身是否在跳过列表
+        base_name_lower = base.name.lower()
+        skip_base = [".git", "$recycle.bin", "system volume information",
+                     "program files", "programdata", "windows",
+                     "appdata", "temp", "tmp", "cache", "node_modules",
+                     "dist-packages", "site-packages", ".venv", "venv",
+                     "__pycache__", "assets", "public", "software",
+                     "games", "game", "steam", "tencent",
+                     "wechat", "thunder", "bilibili", "baidu",
+                     "uucloud", "music", "picture",
+                     "电影", "视频", "音乐", "图片", "$av", "recycler",
+                     "pagefile.sys", "swapfile.sys", "hiberfil.sys",
+                     "$windows.~bt", "bootmgr", "msocache", "intel",
+                     "nvidia", "amd", "perflogs", "recovery", "$winre",
+                     "valorant", "onmyoji", "riot games", "lol",
+                     "league of legends", "honkai", "原神", "王者荣耀"]
+        if any(s in base_name_lower for s in skip_base):
+            return results
+        queue = [(base, 0)]
+        visited = set()
+        found_count = 0
+        while queue and found_count < max_total:
+            current, depth = queue.pop(0)
+            try:
+                key = str(current.resolve())
+                if key in visited:
+                    continue
+                visited.add(key)
+                name = current.name.lower()
+                matched = False
+                if depth > 0:
+                    for kw in ["数字人", "weclone", "train", "model_output", "output",
+                               "sft", "lora", "llm", "finetune", "digital_human"]:
+                        if kw in name:
+                            matched = True
+                            break
+                if matched:
+                    results.append(current)
+                    found_count += 1
+                    sub = current / "model_output"
+                    if sub.exists():
+                        results.append(sub)
+                        found_count += 1
+                if depth < max_depth:
+                    try:
+                        for child in current.iterdir():
+                            try:
+                                if not child.is_dir():
+                                    continue
+                                cname = child.name.lower()
+                                # 第一层遇到系统/游戏目录直接跳过
+                                if depth == 0 and any(s in cname for s in skip_base):
+                                    continue
+                                if any(sk in cname for sk in skip_base):
+                                    continue
+                                queue.append((child, depth + 1))
+                                if len(queue) > 100:
+                                    break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return results
+
+
+_DIR_CACHE_FILE = Path.home() / ".train_monitor_dir_cache.json"
+_DIR_CACHE_TTL = 3600  # 1 小时
+
+def _load_dir_cache():
+    try:
+        if _DIR_CACHE_FILE.exists():
+            import time as _t
+            data = json.loads(_DIR_CACHE_FILE.read_text(encoding="utf-8"))
+            if _t.time() - data.get("ts", 0) < _DIR_CACHE_TTL:
+                return data.get("dirs", [])
+    except Exception:
+        pass
+    return None
+
+def _save_dir_cache(dirs):
+    try:
+        import time as _t
+        data = {"ts": _t.time(), "dirs": [str(d) for d in dirs]}
+        _DIR_CACHE_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def detect_project_dirs(custom_dir=None):
+    """返回候选项目目录列表。优先用户指定目录，其次自动扫描常见位置。带 1 小时缓存。"""
+    # 用户自定义目录：不用缓存
+    if custom_dir:
+        dirs = []
+        seen = set()
+
+        def _add(d_path):
+            try:
+                p = Path(d_path)
+                if not p.exists():
+                    return
+                key = str(p.resolve())
+                if key in seen:
+                    return
+                seen.add(key)
+                dirs.append(p)
+            except Exception:
+                pass
+
+        _add(custom_dir)
+        return dirs
+
+    # 尝试读缓存
+    cached = _load_dir_cache()
+    if cached is not None:
+        # 把缓存的字符串恢复成 Path
+        return [Path(p) for p in cached if Path(p).exists()]
+
     dirs = []
     seen = set()
 
@@ -371,22 +701,79 @@ def detect_project_dirs():
         except Exception:
             pass
 
+    if custom_dir:
+        _add(custom_dir)
     try:
         script_dir = Path(__file__).resolve().parent
         _add(script_dir)
         _add(script_dir.parent)
+        try:
+            _add(script_dir.parent.parent)
+        except Exception:
+            pass
     except Exception:
         pass
     _add(Path.cwd())
+    _add(Path.cwd().parent)
     _add(Path.home() / "Documents")
     _add(Path.home() / "Desktop")
+    _add(Path.home() / "Downloads")
+
+    # 用户主目录下 2 层深度搜索
+    for base in [
+        Path.home(),
+        Path.home() / "Documents",
+        Path.home() / "Downloads",
+        Path.home() / "Desktop",
+    ]:
+        try:
+            for p in _scan_dir_for_projects(base, max_depth=2, max_total=15):
+                _add(p)
+        except Exception:
+            pass
+
+    # C 盘：仅扫主目录（避免扫 Windows/Program Files 太慢）
     try:
-        for d in Path.home().iterdir():
+        for p in _scan_dir_for_projects(Path.home(), max_depth=3, max_total=15):
+            _add(p)
+    except Exception:
+        pass
+
+    # D/E/F/G/H 盘：从盘根扫 3 层（下载文件夹通常在数据盘根下）
+    try:
+        for drive_letter in "DEFGH":
             try:
-                if d.is_dir() and d.name.lower() in {"projects", "repos", "代码", "训练", "train"}:
-                    _add(d)
+                drive = Path(drive_letter + ":/")
+                if not drive.exists():
+                    continue
+                # 第一层排除系统/游戏/缓存目录
+                for sub in drive.iterdir():
+                    try:
+                        if not sub.is_dir():
+                            continue
+                        cname = sub.name.lower()
+                        skip_top = ["$recycle.bin", "system volume information",
+                                    "program files", "programdata", "windows",
+                                    "appdata", "system32", "syswow64",
+                                    "recycler", "recovery", "$winre", "perflogs",
+                                    "msocache", "intel", "amd", "nvidia",
+                                    ".git", "node_modules", "__pycache__",
+                                    "pagefile.sys", "swapfile.sys", "hiberfil.sys",
+                                    "config", "$windows.~bt", "boot", "bootmgr"]
+                        if any(s in cname for s in skip_top):
+                            continue
+                        # 在这里深入扫描 3 层
+                        for deep in _scan_dir_for_projects(sub, max_depth=3, max_total=15):
+                            _add(deep)
+                    except Exception:
+                        pass
             except Exception:
                 pass
+    except Exception:
+        pass
+    # 保存到缓存（避免下次启动全量扫描）
+    try:
+        _save_dir_cache(dirs)
     except Exception:
         pass
     return dirs
@@ -621,21 +1008,70 @@ class MonitorApp:
 
         tk.Label(
             right,
-            text="训练状态",
+            text="训练状态（倒计时）",
             fg=self.FG_BLUE,
             bg=self.BG_CARD,
             font=("Microsoft YaHei", 12, "bold"),
             anchor="w",
         ).pack(fill="x")
-        self.lbl_runtime = tk.Label(
+
+        # 大字显示剩余时间
+        self.lbl_remaining = tk.Label(
             right,
-            text="已运行: --",
+            text="剩余 --:--:--",
             fg=self.FG_GREEN,
             bg=self.BG_CARD,
-            font=("Microsoft YaHei", 14, "bold"),
+            font=("Microsoft YaHei", 22, "bold"),
         )
-        self.lbl_runtime.pack(anchor="w", pady=(4, 8))
+        self.lbl_remaining.pack(anchor="w", pady=(4, 2))
 
+        # 训练进度百分比 + 总步数
+        self.lbl_progress = tk.Label(
+            right,
+            text="进度 --% (0 / 0 步)",
+            fg=self.FG_MAIN,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 11, "bold"),
+        )
+        self.lbl_progress.pack(anchor="w", pady=(0, 4))
+
+        # 进度条
+        self.pb_train = self._mk_progress(right, total=100, color_fill=self.FG_GREEN, height=20)
+        self.pb_train.pack(fill="x", pady=(0, 10))
+
+        # 已用时间 + 预计结束时间
+        self.lbl_timeinfo = tk.Label(
+            right,
+            text="已运行 --   预计结束 --",
+            fg=self.FG_MAIN,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 10),
+        )
+        self.lbl_timeinfo.pack(anchor="w")
+
+        # loss / lr / it/s
+        self.lbl_metrics = tk.Label(
+            right,
+            text="loss --    lr --    it/s --    epoch --",
+            fg=self.FG_ACCENT,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 10),
+        )
+        self.lbl_metrics.pack(anchor="w", pady=(4, 8))
+
+        # 日志路径提示
+        self.lbl_logpath = tk.Label(
+            right,
+            text="",
+            fg=self.FG_SUB,
+            bg=self.BG_CARD,
+            font=("Microsoft YaHei", 8),
+            wraplength=380,
+            justify="left",
+        )
+        self.lbl_logpath.pack(anchor="w", pady=(0, 4))
+
+        # 进程列表
         tk.Label(
             right,
             text="进程列表",
@@ -646,7 +1082,7 @@ class MonitorApp:
         ).pack(fill="x", pady=(6, 2))
         self.txt_procs = tk.Text(
             right,
-            height=6,
+            height=5,
             bg=self.BG_BAR,
             fg=self.FG_MAIN,
             font=("Consolas", 10),
@@ -665,7 +1101,7 @@ class MonitorApp:
         ).pack(fill="x", pady=(12, 2))
         self.txt_ckpt = tk.Text(
             right,
-            height=9,
+            height=6,
             bg=self.BG_BAR,
             fg=self.FG_MAIN,
             font=("Consolas", 10),
@@ -760,6 +1196,7 @@ class MonitorApp:
         procs = []
         ckpts = []
         dirs_searched = []
+        progress = None
         try:
             gpu_info = get_gpu_info()
         except Exception as e:
@@ -773,18 +1210,28 @@ class MonitorApp:
                 dirs_searched = [Path(self.custom_project_dir)]
             else:
                 dirs_searched = detect_project_dirs()
+            # checkpoint 搜索
             ckpts = find_ckpt_files(dirs_searched, since_hours=24)
-        except Exception:
-            ckpts = []
+            # 训练日志解析
+            log_path = find_trainer_log(dirs_searched)
+            if log_path:
+                progress = parse_training_progress(log_path)
+            else:
+                progress = {
+                    "error": "未找到 trainer_log.jsonl（请在顶部选择项目目录）",
+                    "log_path": None,
+                }
+        except Exception as e:
+            progress = {"error": "查找日志异常: %s" % e, "log_path": None}
         try:
             self.root.after(
                 0,
-                lambda: self._update_ui(gpu_info, procs, ckpts, dirs_searched),
+                lambda: self._update_ui(gpu_info, procs, progress, ckpts, dirs_searched),
             )
         finally:
             self.root.after(REFRESH_MS, self.refresh)
 
-    def _update_ui(self, gpu, procs, ckpts, dirs_searched):
+    def _update_ui(self, gpu, procs, progress, ckpts, dirs_searched):
         now = datetime.now()
         up = fmt_duration((now - self.start_time).total_seconds())
         self.lbl_monitor_uptime.config(text="监控运行: %s" % up)
@@ -835,17 +1282,73 @@ class MonitorApp:
             self.gpu_history.append(util)
             self._draw_chart()
 
+        # 训练进度 / 倒计时（从 trainer_log.jsonl 解析）
+        if progress and not progress.get("error") and progress.get("total_steps", 0) > 0:
+            # 优先使用训练框架自己写入的 remaining_time（更准）
+            remaining_sec = progress.get("remaining_sec")
+            if not remaining_sec:
+                # 退而求其次：用我们自己基于最近速度的估算
+                remaining_sec = progress.get("etas")
+            remaining_text = _format_hms(remaining_sec)
+            self.lbl_remaining.config(
+                text="剩余 %s" % remaining_text,
+                fg=self.FG_GREEN,
+            )
+            # 进度条
+            pct = progress.get("percentage", 0)
+            self.lbl_progress.config(
+                text="进度 %.2f%% (%d / %d 步)"
+                % (pct, progress.get("current_steps", 0), progress.get("total_steps", 0)),
+                fg=self.FG_MAIN,
+            )
+            self.pb_train._value = pct
+            self._draw_progress(self.pb_train)
+
+            # 已用时间 + 预计结束时间
+            elapsed = progress.get("elapsed_time", "--")
+            finish = progress.get("finish_time_est")
+            finish_text = finish.strftime("%Y-%m-%d %H:%M:%S") if finish else "--"
+            self.lbl_timeinfo.config(
+                text="已运行 %s   |   预计结束 %s" % (elapsed, finish_text),
+                fg=self.FG_MAIN,
+            )
+
+            # loss / lr / it/s / epoch
+            loss = progress.get("loss", 0)
+            lr = progress.get("lr", 0)
+            it_s = progress.get("it_s")
+            epoch = progress.get("epoch", 0)
+            it_s_text = "%.2f" % it_s if it_s else "--"
+            self.lbl_metrics.config(
+                text="loss %.4f    lr %.2e    it/s %s    epoch %.2f"
+                % (loss, lr, it_s_text, epoch),
+                fg=self.FG_ACCENT,
+            )
+
+            # 日志路径
+            lp = progress.get("log_path") or ""
+            self.lbl_logpath.config(text="日志: %s" % lp)
+
+        else:
+            # 无日志或解析失败
+            self.lbl_remaining.config(text="剩余 --:--:--", fg=self.FG_SUB)
+            self.lbl_progress.config(text="进度 --% (0 / 0 步)", fg=self.FG_SUB)
+            self.pb_train._value = 0.0
+            self._draw_progress(self.pb_train)
+            self.lbl_timeinfo.config(text="已运行 --   预计结束 --", fg=self.FG_SUB)
+            self.lbl_metrics.config(text="loss --    lr --    it/s --    epoch --", fg=self.FG_SUB)
+            msg = ""
+            if progress and progress.get("error"):
+                msg = progress["error"]
+            if not msg:
+                msg = "未发现训练日志。请在顶部选择项目目录（训练脚本所在目录）"
+            self.lbl_logpath.config(text="提示: " + msg)
+            warnings.append("训练日志未找到")
+
         # 进程
         if procs:
             self.txt_procs.config(state="normal")
             self.txt_procs.delete("1.0", "end")
-            main_p = max(procs, key=lambda p: p.get("cpu_s", 0))
-            try:
-                st = datetime.strptime(main_p["start_time"], "%Y/%m/%d %H:%M:%S")
-                runtime = fmt_duration((datetime.now() - st).total_seconds())
-                self.lbl_runtime.config(text="已运行 %s" % runtime, fg=self.FG_GREEN)
-            except Exception:
-                self.lbl_runtime.config(text="已运行 (未知)", fg=self.FG_RED)
             for p in sorted(procs, key=lambda p: p.get("cpu_s", 0), reverse=True):
                 try:
                     st = datetime.strptime(p["start_time"], "%Y/%m/%d %H:%M:%S")
@@ -860,7 +1363,6 @@ class MonitorApp:
             self.txt_procs.config(state="disabled")
             self.lbl_status.config(text="监控中 - 训练正常", fg=self.FG_GREEN)
         else:
-            self.lbl_runtime.config(text="未找到训练进程", fg=self.FG_RED)
             self.txt_procs.config(state="normal")
             self.txt_procs.delete("1.0", "end")
             self.txt_procs.insert(
