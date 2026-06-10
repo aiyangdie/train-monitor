@@ -838,7 +838,7 @@ class MonitorApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("训练实时监控面板 v1.1.0")
+        self.root.title("训练实时监控面板 v1.2.0")
         self.root.geometry("900x680")
         self.root.minsize(780, 580)
         self.root.configure(bg=self.BG_DARK)
