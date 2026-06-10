@@ -21,7 +21,15 @@ env/
 .DS_Store
 Thumbs.db
 
-# Temp files
+# 临时文件
 *.log
 *.tmp
 *.bak
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
+# macOS 构建签名产物
+*.entitlements
