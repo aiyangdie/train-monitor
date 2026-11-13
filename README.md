@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/covers/28-train-monitor.jpg" alt="train-monitor 项目封面" width="100%"></p>
+
 # 训练实时监控面板 (Train Monitor)
 
 一个轻量级的桌面 GUI 工具，实时显示 GPU 利用率、显存、温度、功耗、训练进程、Checkpoint 输出等信息，**无需安装任何第三方依赖**。
